@@ -53,3 +53,6 @@
 
 # clangd cache
 .cache/
+
+# clang-cl cross builds (msvc/toolchain.cmake)
+/build-msvc*/
