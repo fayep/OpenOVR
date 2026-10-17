@@ -143,6 +143,12 @@ DX11Compositor::~DX11Compositor()
 
 	resolvedMSAATextures.clear();
 
+	if (quad_texture_view) {
+		quad_texture_view->Release();
+		quad_texture_view = nullptr;
+	}
+	cached_srv_source = nullptr;
+
 	context->Release();
 	device->Release();
 }
@@ -198,6 +204,12 @@ void DX11Compositor::CheckCreateSwapChain(const vr::Texture_t* texture, const vr
 			tex->Release();
 
 		resolvedMSAATextures.clear();
+
+		if (quad_texture_view) {
+			quad_texture_view->Release();
+			quad_texture_view = nullptr;
+		}
+		cached_srv_source = nullptr;
 
 		// Figure out what format we need to use
 		DxgiFormatInfo info = {};
@@ -327,26 +339,26 @@ void DX11Compositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRT
 
 	// Bounds describe an inverted image so copy texture using pixel shader inverting on copy
 	if (bounds && bounds->vMin > bounds->vMax && oovr_global_configuration.InvertUsingShaders() && !swapchain_rtvs.empty()) {
-		auto* src = (ID3D11Texture2D*)texture->handle;
+		if (src != cached_srv_source || !quad_texture_view) {
+			if (quad_texture_view) {
+				quad_texture_view->Release();
+				quad_texture_view = nullptr;
+			}
+			OOVR_FAILED_DX_ABORT(device->CreateShaderResourceView(src, nullptr, &quad_texture_view));
+			cached_srv_source = src;
+		}
 
-		OOVR_FAILED_DX_ABORT(device->CreateShaderResourceView(src, nullptr, &quad_texture_view));
-
-		float blend_factor[4] = { 1.f, 1.f, 1.f, 1.f };
 		context->OMSetBlendState(nullptr, nullptr, 0xffffffff);
 
-		UINT numViewPorts;
-		context->RSGetViewports(&numViewPorts, nullptr);
-		std::vector<D3D11_VIEWPORT> viewports;
-		viewports.resize(numViewPorts);
-		context->RSGetViewports(&numViewPorts, viewports.data());
+		D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+		UINT numViewPorts = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+		context->RSGetViewports(&numViewPorts, viewports);
 
-		UINT numScissors;
-		context->RSGetScissorRects(&numScissors, nullptr);
-		std::vector<D3D11_RECT> scissors;
-		scissors.resize(numScissors);
-		context->RSGetScissorRects(&numScissors, scissors.data());
+		D3D11_RECT scissors[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+		UINT numScissors = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+		context->RSGetScissorRects(&numScissors, scissors);
 
-		ID3D11RasterizerState* pRSState;
+		ID3D11RasterizerState* pRSState = nullptr;
 		context->RSGetState(&pRSState);
 		context->RSSetState(nullptr);
 
@@ -361,8 +373,6 @@ void DX11Compositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRT
 
 		// Set up for rendering
 		context->OMSetRenderTargets(1, &swapchain_rtvs[currentIndex], nullptr);
-		float clear_colour[4] = { 0.f, 0.f, 0.f, 0.f };
-		context->ClearRenderTargetView(swapchain_rtvs[currentIndex], clear_colour);
 
 		// Set the active shaders and constant buffers.
 		context->PSSetShaderResources(0, 1, &quad_texture_view);
@@ -376,14 +386,15 @@ void DX11Compositor::CopyToSwapchain(const vr::Texture_t* texture, const vr::VRT
 		context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 		context->Draw(4, 0);
 		context->IASetPrimitiveTopology(currTopology);
-		quad_texture_view->Release();
 
 		if (numViewPorts)
-			context->RSSetViewports(numViewPorts, viewports.data());
+			context->RSSetViewports(numViewPorts, viewports);
 		if (numScissors)
-			context->RSSetScissorRects(numScissors, scissors.data());
+			context->RSSetScissorRects(numScissors, scissors);
 
 		context->RSSetState(pRSState);
+		if (pRSState)
+			pRSState->Release();
 	} else {
 		// Apparently SteamVR supports apps just sending array textures without specifying what's what.
 		const int arrayIndex = (srcDesc.ArraySize > 1 && eye.has_value()) ? static_cast<int>(*eye) : 0;
