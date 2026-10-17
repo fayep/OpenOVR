@@ -10,6 +10,7 @@
 #include <errno.h> // errno, ENOENT, EEXIST
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <stdarg.h>
 #include <sys/stat.h> // stat
@@ -135,7 +136,18 @@ std::string GetEnv(const std::string& var)
 #ifdef ANDROID
 #include <android/log.h>
 #else
-static std::ofstream stream;
+// Constructors in other translation units (Config's, for one) can log before this file's globals
+// are constructed, so the stream is constructed on first use instead.
+static std::ofstream& log_stream()
+{
+	static std::ofstream stream;
+	return stream;
+}
+static std::mutex& log_mutex()
+{
+	static std::mutex mutex;
+	return mutex;
+}
 
 #ifdef __GLIBCXX__
 #include <ext/stdio_filebuf.h>
@@ -164,6 +176,7 @@ static FILE* cfile(std::ofstream& ofs)
 
 static void init_stream()
 {
+	std::ofstream& stream = log_stream();
 	if (!stream.is_open()) {
 		string outputFilePath = "opencomposite.log";
 
@@ -252,8 +265,11 @@ void oovr_log_raw(const char* file, long line, const char* func, const char* msg
 #ifdef ANDROID
 	__android_log_print(ANDROID_LOG_INFO, "OpenComposite", "%s:%d \t %s", func, line, msg);
 #else
-	init_stream();
-	stream << "[" << format_time() << "] " << func << ":" << line << "\t- " << (msg ? msg : "NULL") << std::endl;
+	{
+		std::lock_guard lock(log_mutex());
+		init_stream();
+		log_stream() << "[" << format_time() << "] " << func << ":" << line << "\t- " << (msg ? msg : "NULL") << std::endl;
+	}
 
 	// Write it to stdout
 	// TODO on Windows, write it into the debug log
@@ -261,7 +277,6 @@ void oovr_log_raw(const char* file, long line, const char* func, const char* msg
 	printf("[OC] %s:%ld \t %s\n", func, line, msg);
 #endif
 
-	// Do we need to close the stream or something? What about multiple threads?
 #endif
 }
 
@@ -305,7 +320,10 @@ OC_NORETURN void oovr_abort_raw_va(const char* file, long line, const char* func
 #ifdef ANDROID
 	__android_log_print(ANDROID_LOG_ERROR, "OpenComposite", "ERROR: %s:%d \t %s", func, line, buff);
 #else
-	stream << std::flush;
+	{
+		std::lock_guard lock(log_mutex());
+		log_stream() << std::flush;
+	}
 #endif
 
 	OOVR_MESSAGE(buff, title);
