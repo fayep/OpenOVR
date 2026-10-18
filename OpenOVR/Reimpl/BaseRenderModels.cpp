@@ -13,6 +13,9 @@
 #include "BaseSystem.h"
 #include "Misc/Input/InteractionProfile.h"
 
+#include <cstdlib>
+#include <fstream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -159,12 +162,134 @@ static OOVR_RenderModel_Vertex_t split_face(
 	return out;
 }
 
+// Controller models converted on this machine from ones the user owns (OpenComposite can't ship
+// them), used in place of the built-in hands when present:
+//   %LOCALAPPDATA%\OpenComposite\rendermodels\controller_<left|right>.obj
+//     triangles in metres, in the frame of the controller pose OpenComposite reports, with
+//     v/vt/vn faces and texture coordinates as OpenVR has them (v down from the top);
+//   controller_<left|right>.rgba
+//     the texture: width and height as little-endian uint32s, then RGBA8 rows, top first.
+// Their textures go by these ids.
+enum { LOCAL_TEXTURE_LEFT = 1, LOCAL_TEXTURE_RIGHT = 2 };
+
+static string localModelPath(bool left, const char* ext)
+{
+	const char* base = getenv("LOCALAPPDATA");
+	if (!base)
+		return {};
+	return string(base) + "\\OpenComposite\\rendermodels\\controller_" + (left ? "left" : "right") + "." + ext;
+}
+
+static bool loadLocalTexture(bool left, uint32_t* width, uint32_t* height, std::vector<uint8_t>* pixels)
+{
+	std::ifstream in(localModelPath(left, "rgba"), std::ios::binary);
+	uint8_t header[8];
+	if (!in.read((char*)header, sizeof(header)))
+		return false;
+	*width = header[0] | header[1] << 8 | header[2] << 16 | (uint32_t)header[3] << 24;
+	*height = header[4] | header[5] << 8 | header[6] << 16 | (uint32_t)header[7] << 24;
+	if (!*width || !*height || *width > 8192 || *height > 8192)
+		return false;
+	pixels->resize((size_t)*width * *height * 4);
+	return (bool)in.read((char*)pixels->data(), (std::streamsize)pixels->size());
+}
+
+// The local model for a controller, or false to fall back to the built-in one.
+static bool loadLocalModel(bool left, OOVR_RenderModel_t** renderModel)
+{
+	string path = localModelPath(left, "obj");
+	std::ifstream in(path);
+	if (!in) {
+		OOVR_LOGF("No local render model for the %s controller at %s", left ? "left" : "right", path.c_str());
+		return false;
+	}
+
+	std::vector<vr::HmdVector3_t> verts, normals;
+	std::vector<vr::HmdVector2_t> uvs;
+	std::vector<OOVR_RenderModel_Vertex_t> vertices;
+	std::vector<uint16_t> indices;
+	std::map<string, uint16_t> seen; // one vertex per distinct v/vt/vn
+
+	string line;
+	while (std::getline(in, line)) {
+		std::istringstream ls(line);
+		string op;
+		ls >> op;
+		if (op == "v") {
+			vr::HmdVector3_t v;
+			ls >> v.v[0] >> v.v[1] >> v.v[2];
+			verts.push_back(v);
+		} else if (op == "vt") {
+			vr::HmdVector2_t v;
+			ls >> v.v[0] >> v.v[1];
+			uvs.push_back(v);
+		} else if (op == "vn") {
+			vr::HmdVector3_t v;
+			ls >> v.v[0] >> v.v[1] >> v.v[2];
+			normals.push_back(v);
+		} else if (op == "f") {
+			for (int i = 0; i < 3; i++) {
+				string spec;
+				ls >> spec;
+				auto it = seen.find(spec);
+				if (it != seen.end()) {
+					indices.push_back(it->second);
+					continue;
+				}
+				int v = 0, vt = 0, vn = 0;
+				if (sscanf(spec.c_str(), "%d/%d/%d", &v, &vt, &vn) != 3 || v < 1 || vt < 1 || vn < 1
+				    || v > (int)verts.size() || vt > (int)uvs.size() || vn > (int)normals.size()
+				    || vertices.size() >= 65535) {
+					OOVR_LOGF("Local render model %s: bad or too many vertices at %s", localModelPath(left, "obj").c_str(),
+					    spec.c_str());
+					return false;
+				}
+				OOVR_RenderModel_Vertex_t out{};
+				out.vPosition = verts[v - 1];
+				out.vNormal = normals[vn - 1];
+				out.rfTextureCoord[0] = uvs[vt - 1].v[0];
+				out.rfTextureCoord[1] = uvs[vt - 1].v[1];
+				seen[spec] = (uint16_t)vertices.size();
+				indices.push_back((uint16_t)vertices.size());
+				vertices.push_back(out);
+			}
+		}
+	}
+	if (indices.empty())
+		return false;
+
+	OOVR_RenderModel_t* rm = new OOVR_RenderModel_t();
+	OOVR_RenderModel_Vertex_t* vertexData = new OOVR_RenderModel_Vertex_t[vertices.size()];
+	std::copy(vertices.begin(), vertices.end(), vertexData);
+	uint16_t* indexData = new uint16_t[indices.size()];
+	std::copy(indices.begin(), indices.end(), indexData);
+	rm->rVertexData = vertexData;
+	rm->unVertexCount = (uint32_t)vertices.size();
+	rm->rIndexData = indexData;
+	rm->unTriangleCount = (uint32_t)(indices.size() / 3);
+	uint32_t w, h;
+	std::vector<uint8_t> pixels;
+	rm->diffuseTextureId = loadLocalTexture(left, &w, &h, &pixels) ? (left ? LOCAL_TEXTURE_LEFT : LOCAL_TEXTURE_RIGHT) : -1;
+	OOVR_LOGF("Local render model for the %s controller: %u vertices, %u triangles, %s", left ? "left" : "right",
+	    rm->unVertexCount, rm->unTriangleCount, rm->diffuseTextureId < 0 ? "no texture" : "textured");
+	*renderModel = rm;
+	return true;
+}
+
 EVRRenderModelError BaseRenderModels::LoadRenderModel_Async(const char* pchRenderModelName, RenderModel_t** renderModel)
 {
 	OOVR_LOGF("LoadRenderModel_Async %s", pchRenderModelName);
 	string name = pchRenderModelName;
 	int rid;
 	float sided;
+
+	if (name == "oculus_quest2_controller_left" || name == "{indexcontroller}valve_controller_knu_1_0_left") {
+		if (loadLocalModel(true, renderModel))
+			return VRRenderModelError_None;
+	} else if (name == "oculus_quest2_controller_right" || name == "{indexcontroller}valve_controller_knu_1_0_right") {
+		if (loadLocalModel(false, renderModel))
+			return VRRenderModelError_None;
+	}
 
 	// todo: start loading correct models, !359 related
 	if (name == "renderLeftHand") {
@@ -286,6 +411,20 @@ void BaseRenderModels::FreeRenderModel(RenderModel_t* renderModel)
 
 EVRRenderModelError BaseRenderModels::LoadTexture_Async(TextureID_t textureId, RenderModel_TextureMap_t** texture)
 {
+	if (textureId == LOCAL_TEXTURE_LEFT || textureId == LOCAL_TEXTURE_RIGHT) {
+		uint32_t w, h;
+		std::vector<uint8_t> pixels;
+		if (loadLocalTexture(textureId == LOCAL_TEXTURE_LEFT, &w, &h, &pixels)) {
+			*texture = new RenderModel_TextureMap_t();
+			(*texture)->unWidth = (uint16_t)w;
+			(*texture)->unHeight = (uint16_t)h;
+			uint8_t* d = new uint8_t[pixels.size()];
+			std::copy(pixels.begin(), pixels.end(), d);
+			(*texture)->rubTextureMapData = d;
+			return VRRenderModelError_None;
+		}
+	}
+
 	*texture = new RenderModel_TextureMap_t();
 	RenderModel_TextureMap_t& tx = **texture;
 
@@ -343,6 +482,34 @@ EVRRenderModelError BaseRenderModels::LoadIntoTextureD3D11_Async(TextureID_t tex
 	D3D11_TEXTURE2D_DESC desc;
 	output->GetDesc(&desc);
 
+	// A local model's texture, each mip level box-filtered from the one above; the game made the
+	// texture from LoadTexture_Async's size.
+	uint32_t localW = 0, localH = 0;
+	std::vector<uint8_t> local;
+	std::vector<std::vector<uint8_t>> levels;
+	if ((textureId == LOCAL_TEXTURE_LEFT || textureId == LOCAL_TEXTURE_RIGHT)
+	    && loadLocalTexture(textureId == LOCAL_TEXTURE_LEFT, &localW, &localH, &local) && localW == desc.Width
+	    && localH == desc.Height) {
+		levels.push_back(std::move(local));
+		for (uint32_t m = 1, w = localW, h = localH; m < desc.MipLevels; m++) {
+			uint32_t nw = w > 1 ? w / 2 : 1, nh = h > 1 ? h / 2 : 1;
+			const std::vector<uint8_t>& src = levels.back();
+			std::vector<uint8_t> dst((size_t)nw * nh * 4);
+			for (uint32_t y = 0; y < nh; y++)
+				for (uint32_t x = 0; x < nw; x++)
+					for (int c = 0; c < 4; c++) {
+						uint32_t x0 = std::min(x * 2, w - 1), x1 = std::min(x * 2 + 1, w - 1);
+						uint32_t y0 = std::min(y * 2, h - 1), y1 = std::min(y * 2 + 1, h - 1);
+						dst[((size_t)y * nw + x) * 4 + c] = (uint8_t)((src[((size_t)y0 * w + x0) * 4 + c] + src[((size_t)y0 * w + x1) * 4 + c]
+						                                                 + src[((size_t)y1 * w + x0) * 4 + c] + src[((size_t)y1 * w + x1) * 4 + c] + 2)
+						    / 4);
+					}
+			levels.push_back(std::move(dst));
+			w = nw;
+			h = nh;
+		}
+	}
+
 	// Quite conveniently, HmdColor_t happens to have the perfect layout for this
 	int px_count = desc.Width * desc.Height;
 	pix_t* pixels = new pix_t[px_count];
@@ -354,7 +521,12 @@ EVRRenderModelError BaseRenderModels::LoadIntoTextureD3D11_Async(TextureID_t tex
 	int count = desc.MipLevels * desc.ArraySize;
 	D3D11_SUBRESOURCE_DATA* init = new D3D11_SUBRESOURCE_DATA[count];
 	for (int i = 0; i < count; i++) {
-		init[i] = { pixels, sizeof(uint32_t), 0 };
+		if (!levels.empty()) {
+			uint32_t mip = i % desc.MipLevels, w = std::max(desc.Width >> mip, 1u);
+			init[i] = { levels[mip].data(), w * 4, 0 };
+		} else {
+			init[i] = { pixels, sizeof(uint32_t), 0 };
+		}
 	}
 
 	ID3D11Texture2D* tempTex;
