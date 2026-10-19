@@ -43,6 +43,10 @@ set(CMAKE_EXE_LINKER_FLAGS_INIT "${_lib}")
 set(CMAKE_SHARED_LINKER_FLAGS_INIT "${_lib}")
 set(CMAKE_MODULE_LINKER_FLAGS_INIT "${_lib}")
 
+# Link the C and C++ runtime statically, since a game may have installed an older msvcp140.dll
+# into its prefix, and that one would be loaded instead.
+set(CMAKE_MSVC_RUNTIME_LIBRARY MultiThreaded)
+
 # xwin leaves out the debug CRT, so CMake's compiler checks use Release.
 set(CMAKE_TRY_COMPILE_CONFIGURATION Release)
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
